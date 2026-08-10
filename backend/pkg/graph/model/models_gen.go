@@ -1419,6 +1419,7 @@ type StatusType string
 
 const (
 	StatusTypeCreated  StatusType = "created"
+	StatusTypeQueued   StatusType = "queued"
 	StatusTypeRunning  StatusType = "running"
 	StatusTypeWaiting  StatusType = "waiting"
 	StatusTypeFinished StatusType = "finished"
@@ -1427,6 +1428,7 @@ const (
 
 var AllStatusType = []StatusType{
 	StatusTypeCreated,
+	StatusTypeQueued,
 	StatusTypeRunning,
 	StatusTypeWaiting,
 	StatusTypeFinished,
@@ -1435,7 +1437,7 @@ var AllStatusType = []StatusType{
 
 func (e StatusType) IsValid() bool {
 	switch e {
-	case StatusTypeCreated, StatusTypeRunning, StatusTypeWaiting, StatusTypeFinished, StatusTypeFailed:
+	case StatusTypeCreated, StatusTypeQueued, StatusTypeRunning, StatusTypeWaiting, StatusTypeFinished, StatusTypeFailed:
 		return true
 	}
 	return false

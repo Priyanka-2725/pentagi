@@ -4,6 +4,7 @@ scalar Map
 # Core execution status for flows, tasks and agents
 enum StatusType {
   created
+  queued
   running
   waiting
   finished

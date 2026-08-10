@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"pentagi/pkg/cast"
 	"pentagi/pkg/config"
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
@@ -65,22 +66,154 @@ type FlowController interface {
 // goroutine forever once the sweep is detached from the request context.
 const reassignProviderTimeout = 30 * time.Second
 
+type queuedFlow struct {
+	flowID    int64
+	userID    int64
+	input     string
+	prvname   provider.ProviderName
+	prvtype   provider.ProviderType
+	functions *tools.Functions
+	resources []database.UserResource
+	createdAt time.Time
+}
+
+type queuedFlowWorker struct {
+	flowID   int64
+	userID   int64
+	title    string
+	status   database.FlowStatus
+	mx       sync.Mutex
+	db       database.Querier
+	subs     subscriptions.SubscriptionsController
+	onCancel func(flowID int64)
+}
+
+func (w *queuedFlowWorker) GetFlowID() int64          { return w.flowID }
+func (w *queuedFlowWorker) GetUserID() int64          { return w.userID }
+func (w *queuedFlowWorker) GetTitle() string           { return w.title }
+func (w *queuedFlowWorker) GetContext() *FlowContext   { return nil }
+
+func (w *queuedFlowWorker) GetStatus(ctx context.Context) (database.FlowStatus, error) {
+	w.mx.Lock()
+	defer w.mx.Unlock()
+	return w.status, nil
+}
+
+func (w *queuedFlowWorker) SetStatus(ctx context.Context, status database.FlowStatus) error {
+	w.mx.Lock()
+	defer w.mx.Unlock()
+	w.status = status
+	if w.db != nil {
+		flow, err := w.db.UpdateFlowStatus(ctx, database.UpdateFlowStatusParams{
+			ID:     w.flowID,
+			Status: status,
+		})
+		if err != nil {
+			return err
+		}
+		if w.subs != nil {
+			pub := w.subs.NewFlowPublisher(w.userID, w.flowID)
+			pub.FlowUpdated(ctx, flow, nil)
+		}
+	}
+	return nil
+}
+
+func (w *queuedFlowWorker) AddAssistant(ctx context.Context, aw AssistantWorker) error {
+	return fmt.Errorf("cannot add assistant to queued flow %d", w.flowID)
+}
+
+func (w *queuedFlowWorker) GetAssistant(ctx context.Context, assistantID int64) (AssistantWorker, error) {
+	return nil, fmt.Errorf("assistant %d not found", assistantID)
+}
+
+func (w *queuedFlowWorker) DeleteAssistant(ctx context.Context, assistantID int64) error {
+	return nil
+}
+
+func (w *queuedFlowWorker) ListAssistants(ctx context.Context) []AssistantWorker {
+	return nil
+}
+
+func (w *queuedFlowWorker) ListTasks(ctx context.Context) []TaskWorker {
+	return nil
+}
+
+func (w *queuedFlowWorker) PutInput(
+	ctx context.Context,
+	input string,
+	prv provider.Provider,
+	resources []database.UserResource,
+) error {
+	return fmt.Errorf("flow %d is queued, waiting for a free execution slot", w.flowID)
+}
+
+func (w *queuedFlowWorker) PutResources(ctx context.Context, resources []database.UserResource) error {
+	return nil
+}
+
+func (w *queuedFlowWorker) Finish(ctx context.Context) error {
+	_ = w.SetStatus(ctx, database.FlowStatusFinished)
+	if w.onCancel != nil {
+		w.onCancel(w.flowID)
+	}
+	return nil
+}
+
+func (w *queuedFlowWorker) Stop(ctx context.Context) error {
+	_ = w.SetStatus(ctx, database.FlowStatusFailed)
+	if w.onCancel != nil {
+		w.onCancel(w.flowID)
+	}
+	return nil
+}
+
+func (w *queuedFlowWorker) Rename(ctx context.Context, title string) error {
+	w.mx.Lock()
+	w.title = title
+	w.mx.Unlock()
+	if w.db != nil {
+		flow, err := w.db.UpdateFlowTitle(ctx, database.UpdateFlowTitleParams{
+			ID:    w.flowID,
+			Title: title,
+		})
+		if err != nil {
+			return err
+		}
+		if w.subs != nil {
+			pub := w.subs.NewFlowPublisher(w.userID, w.flowID)
+			pub.FlowUpdated(ctx, flow, nil)
+		}
+	}
+	return nil
+}
+
+func (w *queuedFlowWorker) WaitTaskCompletion(ctx context.Context) error {
+	return nil
+}
+
+func (w *queuedFlowWorker) InvalidateTaskSubtasks(ctx context.Context, taskID int64, subtaskIDs []int64) {
+}
+
 type flowController struct {
-	db     database.Querier
-	mx     *sync.Mutex
-	cfg    *config.Config
-	flows  map[int64]FlowWorker
-	docker docker.DockerClient
-	provs  providers.ProviderController
-	subs   subscriptions.SubscriptionsController
-	alc    AgentLogController
-	mlc    MsgLogController
-	aslc   AssistantLogController
-	slc    SearchLogController
-	tlc    TermLogController
-	vslc   VectorStoreLogController
-	tclc   ToolCallLogController
-	sc     ScreenshotController
+	db         database.Querier
+	mx         *sync.Mutex
+	cfg        *config.Config
+	flows      map[int64]FlowWorker
+	queue      []*queuedFlow
+	newWorker  func(ctx context.Context, fwc newFlowWorkerCtx) (FlowWorker, error)
+	loadWorker func(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) (FlowWorker, error)
+	docker     docker.DockerClient
+	provs      providers.ProviderController
+	subs       subscriptions.SubscriptionsController
+	alc        AgentLogController
+	mlc        MsgLogController
+	aslc       AssistantLogController
+	slc        SearchLogController
+	tlc        TermLogController
+	vslc       VectorStoreLogController
+	tclc       ToolCallLogController
+	sc         ScreenshotController
 }
 
 func NewFlowController(
@@ -109,14 +242,137 @@ func NewFlowController(
 	}
 }
 
+func (fc *flowController) getNewWorker() func(ctx context.Context, fwc newFlowWorkerCtx) (FlowWorker, error) {
+	if fc.newWorker != nil {
+		return fc.newWorker
+	}
+	return NewFlowWorker
+}
+
+func (fc *flowController) getLoadWorker() func(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) (FlowWorker, error) {
+	if fc.loadWorker != nil {
+		return fc.loadWorker
+	}
+	return LoadFlowWorker
+}
+
+func (fc *flowController) countActiveFlowsLocked(ctx context.Context) int {
+	active := 0
+	for _, fw := range fc.flows {
+		st, err := fw.GetStatus(ctx)
+		if err != nil {
+			continue
+		}
+		if st == database.FlowStatusRunning || st == database.FlowStatusWaiting {
+			active++
+		}
+	}
+	return active
+}
+
+func (fc *flowController) promoteNextQueuedFlowsLocked(ctx context.Context) {
+	if fc.cfg == nil || fc.cfg.MaxConcurrentFlows <= 0 {
+		for len(fc.queue) > 0 {
+			qf := fc.queue[0]
+			fc.queue = fc.queue[1:]
+			fc.promoteQueuedFlowLocked(ctx, qf)
+		}
+		return
+	}
+
+	for fc.countActiveFlowsLocked(ctx) < fc.cfg.MaxConcurrentFlows && len(fc.queue) > 0 {
+		qf := fc.queue[0]
+		fc.queue = fc.queue[1:]
+		fc.promoteQueuedFlowLocked(ctx, qf)
+	}
+}
+
+func (fc *flowController) promoteQueuedFlowLocked(ctx context.Context, qf *queuedFlow) {
+	existing, ok := fc.flows[qf.flowID]
+	if ok {
+		st, err := existing.GetStatus(ctx)
+		if err == nil && (st == database.FlowStatusFinished || st == database.FlowStatusFailed) {
+			return
+		}
+	}
+
+	fwWorkerCtx := flowWorkerCtx{
+		db:     fc.db,
+		cfg:    fc.cfg,
+		docker: fc.docker,
+		provs:  fc.provs,
+		subs:   fc.subs,
+		flowProviderControllers: flowProviderControllers{
+			mlc:  fc.mlc,
+			aslc: fc.aslc,
+			alc:  fc.alc,
+			slc:  fc.slc,
+			tlc:  fc.tlc,
+			vslc: fc.vslc,
+			tclc: fc.tclc,
+			sc:   fc.sc,
+		},
+	}
+
+	_, _ = fc.db.UpdateFlowStatus(ctx, database.UpdateFlowStatusParams{
+		ID:     qf.flowID,
+		Status: database.FlowStatusRunning,
+	})
+
+	fw, err := fc.getNewWorker()(ctx, newFlowWorkerCtx{
+		userID:        qf.userID,
+		input:         qf.input,
+		prvname:       qf.prvname,
+		prvtype:       qf.prvtype,
+		functions:     qf.functions,
+		resources:     qf.resources,
+		flowWorkerCtx: fwWorkerCtx,
+	})
+	if err != nil {
+		logrus.WithContext(ctx).WithError(err).Errorf("failed to promote queued flow %d", qf.flowID)
+		_ = fc.db.UpdateFlowStatus(ctx, database.UpdateFlowStatusParams{
+			ID:     qf.flowID,
+			Status: database.FlowStatusFailed,
+		})
+		return
+	}
+
+	fc.flows[qf.flowID] = fw
+}
+
 func (fc *flowController) LoadFlows(ctx context.Context) error {
+	fc.mx.Lock()
+	defer fc.mx.Unlock()
+
 	flows, err := fc.db.GetFlows(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to load flows: %w", err)
 	}
 
 	for _, flow := range flows {
-		fw, err := LoadFlowWorker(ctx, flow, flowWorkerCtx{
+		if flow.Status == database.FlowStatusQueued {
+			qf := &queuedFlow{
+				flowID:    flow.ID,
+				userID:    flow.UserID,
+				input:     "",
+				prvname:   provider.ProviderName(flow.ModelProviderName),
+				prvtype:   provider.ProviderType(flow.ModelProviderType),
+				createdAt: flow.CreatedAt,
+			}
+			fc.queue = append(fc.queue, qf)
+			qw := &queuedFlowWorker{
+				flowID: flow.ID,
+				userID: flow.UserID,
+				title:  flow.Title,
+				status: database.FlowStatusQueued,
+				db:     fc.db,
+				subs:   fc.subs,
+			}
+			fc.flows[flow.ID] = qw
+			continue
+		}
+
+		fw, err := fc.getLoadWorker()(ctx, flow, flowWorkerCtx{
 			db:     fc.db,
 			cfg:    fc.cfg,
 			docker: fc.docker,
@@ -145,6 +401,8 @@ func (fc *flowController) LoadFlows(ctx context.Context) error {
 		fc.flows[flow.ID] = fw
 	}
 
+	fc.promoteNextQueuedFlowsLocked(ctx)
+
 	return nil
 }
 
@@ -160,30 +418,90 @@ func (fc *flowController) CreateFlow(
 	fc.mx.Lock()
 	defer fc.mx.Unlock()
 
-	fw, err := NewFlowWorker(ctx, newFlowWorkerCtx{
-		userID:    userID,
-		input:     input,
-		prvname:   prvname,
-		prvtype:   prvtype,
-		functions: functions,
-		resources: resources,
-		flowWorkerCtx: flowWorkerCtx{
+	activeCount := fc.countActiveFlowsLocked(ctx)
+	if fc.cfg != nil && fc.cfg.MaxConcurrentFlows > 0 && activeCount >= fc.cfg.MaxConcurrentFlows {
+		flow, err := fc.db.CreateFlow(ctx, database.CreateFlowParams{
+			Title:              "untitled",
+			Status:             database.FlowStatusQueued,
+			Model:              "unknown",
+			ModelProviderName:  prvname.String(),
+			ModelProviderType:  database.ProviderType(prvtype),
+			Language:           "English",
+			ToolCallIDTemplate: cast.ToolCallIDTemplate,
+			Functions:          []byte("{}"),
+			UserID:             userID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create queued flow in DB: %w", err)
+		}
+
+		qf := &queuedFlow{
+			flowID:    flow.ID,
+			userID:    userID,
+			input:     input,
+			prvname:   prvname,
+			prvtype:   prvtype,
+			functions: functions,
+			resources: resources,
+			createdAt: time.Now(),
+		}
+		fc.queue = append(fc.queue, qf)
+
+		qw := &queuedFlowWorker{
+			flowID: flow.ID,
+			userID: userID,
+			title:  "untitled",
+			status: database.FlowStatusQueued,
 			db:     fc.db,
-			cfg:    fc.cfg,
-			docker: fc.docker,
-			provs:  fc.provs,
 			subs:   fc.subs,
-			flowProviderControllers: flowProviderControllers{
-				mlc:  fc.mlc,
-				aslc: fc.aslc,
-				alc:  fc.alc,
-				slc:  fc.slc,
-				tlc:  fc.tlc,
-				vslc: fc.vslc,
-				tclc: fc.tclc,
-				sc:   fc.sc,
+			onCancel: func(fID int64) {
+				fc.mx.Lock()
+				defer fc.mx.Unlock()
+				for i, item := range fc.queue {
+					if item.flowID == fID {
+						fc.queue = append(fc.queue[:i], fc.queue[i+1:]...)
+						break
+					}
+				}
+				fc.promoteNextQueuedFlowsLocked(context.Background())
 			},
+		}
+		fc.flows[flow.ID] = qw
+
+		if fc.subs != nil {
+			pub := fc.subs.NewFlowPublisher(userID, flow.ID)
+			pub.FlowCreated(ctx, flow, nil)
+		}
+
+		return qw, nil
+	}
+
+	fwWorkerCtx := flowWorkerCtx{
+		db:     fc.db,
+		cfg:    fc.cfg,
+		docker: fc.docker,
+		provs:  fc.provs,
+		subs:   fc.subs,
+		flowProviderControllers: flowProviderControllers{
+			mlc:  fc.mlc,
+			aslc: fc.aslc,
+			alc:  fc.alc,
+			slc:  fc.slc,
+			tlc:  fc.tlc,
+			vslc: fc.vslc,
+			tclc: fc.tclc,
+			sc:   fc.sc,
 		},
+	}
+
+	fw, err := fc.getNewWorker()(ctx, newFlowWorkerCtx{
+		userID:        userID,
+		input:         input,
+		prvname:       prvname,
+		prvtype:       prvtype,
+		functions:     functions,
+		resources:     resources,
+		flowWorkerCtx: fwWorkerCtx,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create flow worker: %w", err)
@@ -369,6 +687,15 @@ func (fc *flowController) StopFlow(ctx context.Context, flowID int64) error {
 		return fmt.Errorf("failed to stop flow %d: %w", flowID, err)
 	}
 
+	for i, item := range fc.queue {
+		if item.flowID == flowID {
+			fc.queue = append(fc.queue[:i], fc.queue[i+1:]...)
+			break
+		}
+	}
+
+	fc.promoteNextQueuedFlowsLocked(ctx)
+
 	return nil
 }
 
@@ -386,7 +713,16 @@ func (fc *flowController) FinishFlow(ctx context.Context, flowID int64) error {
 		return fmt.Errorf("failed to finish flow %d: %w", flowID, err)
 	}
 
+	for i, item := range fc.queue {
+		if item.flowID == flowID {
+			fc.queue = append(fc.queue[:i], fc.queue[i+1:]...)
+			break
+		}
+	}
+
 	delete(fc.flows, flowID)
+
+	fc.promoteNextQueuedFlowsLocked(ctx)
 
 	return nil
 }

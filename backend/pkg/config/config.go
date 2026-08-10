@@ -22,6 +22,9 @@ type Config struct {
 	DataDir string `env:"DATA_DIR" envDefault:"./data"`
 	AskUser bool   `env:"ASK_USER" envDefault:"false"`
 
+	// MaxConcurrentFlows limits concurrently active flows (0 = unlimited)
+	MaxConcurrentFlows int `env:"MAX_CONCURRENT_FLOWS" envDefault:"0"`
+
 	// TenantID namespaces every externally-visible artifact this instance creates
 	// (PostgreSQL schema, docker object names, Graphiti group ids, telemetry identity)
 	TenantID string `env:"TENANT_ID" envDefault:""`

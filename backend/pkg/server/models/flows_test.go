@@ -15,6 +15,7 @@ func TestFlowStatusValid(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid created", FlowStatusCreated, false},
+		{"valid queued", FlowStatusQueued, false},
 		{"valid running", FlowStatusRunning, false},
 		{"valid waiting", FlowStatusWaiting, false},
 		{"valid finished", FlowStatusFinished, false},

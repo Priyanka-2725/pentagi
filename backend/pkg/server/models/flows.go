@@ -13,6 +13,7 @@ type FlowStatus string
 
 const (
 	FlowStatusCreated  FlowStatus = "created"
+	FlowStatusQueued   FlowStatus = "queued"
 	FlowStatusRunning  FlowStatus = "running"
 	FlowStatusWaiting  FlowStatus = "waiting"
 	FlowStatusFinished FlowStatus = "finished"
@@ -27,6 +28,7 @@ func (s FlowStatus) String() string {
 func (s FlowStatus) Valid() error {
 	switch s {
 	case FlowStatusCreated,
+		FlowStatusQueued,
 		FlowStatusRunning,
 		FlowStatusWaiting,
 		FlowStatusFinished,

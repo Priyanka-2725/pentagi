@@ -150,6 +150,7 @@ type FlowStatus string
 
 const (
 	FlowStatusCreated  FlowStatus = "created"
+	FlowStatusQueued   FlowStatus = "queued"
 	FlowStatusRunning  FlowStatus = "running"
 	FlowStatusWaiting  FlowStatus = "waiting"
 	FlowStatusFinished FlowStatus = "finished"
